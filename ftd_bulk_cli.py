@@ -8,76 +8,97 @@ BASE_URL = "https://api.us.security.cisco.com/firewall"
 PAGE_SIZE = 100
 
 
-def get_headers():
-    token = os.environ.get("API_TOKEN")
-    if not token:
-        print("Error: API_TOKEN environment variable is not set.", file=sys.stderr)
-        sys.exit(1)
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+class SCCClient:
+    def __init__(self):
+        token = os.environ.get("API_TOKEN")
+        if not token:
+            print("Error: API_TOKEN environment variable is not set.", file=sys.stderr)
+            sys.exit(1)
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+        )
+        self.manager = None
+        self.ftds = []
 
+    @property
+    def _domain_url(self):
+        return f"{BASE_URL}/v1/cdfmc/api/fmc_config/v1/domain/{self.manager['fmcDomainUid']}"
 
-def get_manager(session):
-    url = f"{BASE_URL}/v1/inventory/managers"
-    response = session.get(url, params={"q": "deviceType:CDFMC"})
-    response.raise_for_status()
-    items = response.json().get("items", [])
-    if not items:
-        print("Error: No cdFMC manager found.", file=sys.stderr)
-        sys.exit(1)
-    return items[0]
-
-
-def get_ftds(session):
-    url = f"{BASE_URL}/v1/inventory/devices"
-    ftds = []
-    offset = 0
-
-    while True:
-        params = {
-            "q": "deviceType:CDFMC_MANAGED_FTD",
-            "limit": PAGE_SIZE,
-            "offset": offset,
-        }
-        response = session.get(url, params=params)
+    def get_manager(self):
+        url = f"{BASE_URL}/v1/inventory/managers"
+        response = self.session.get(url, params={"q": "deviceType:CDFMC"})
         response.raise_for_status()
-        data = response.json()
+        items = response.json().get("items", [])
+        if not items:
+            print("Error: No cdFMC manager found.", file=sys.stderr)
+            sys.exit(1)
+        self.manager = items[0]
+        return self.manager
 
-        items = data.get("items", [])
-        ftds.extend(items)
+    def get_ftds(self):
+        url = f"{BASE_URL}/v1/inventory/devices"
+        ftds = []
+        offset = 0
+        while True:
+            params = {
+                "q": "deviceType:CDFMC_MANAGED_FTD",
+                "limit": PAGE_SIZE,
+                "offset": offset,
+            }
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", [])
+            ftds.extend(items)
+            total_count = data.get("count", 0)
+            offset += len(items)
+            if offset >= total_count or not items:
+                break
+        self.ftds = ftds
+        return ftds
 
-        total_count = data.get("count", 0)
-        offset += len(items)
+    def bulk_command(self, cmd):
+        url = f"{self._domain_url}/devices/devicerecords/operational/bulkcommands"
+        payload = {
+            "command": cmd,
+            "devices": [ftd["uidOnFmc"] for ftd in self.ftds],
+            "type": "BulkCommand",
+        }
+        response = self.session.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()["metadata"]["task"]
 
-        if offset >= total_count or not items:
-            break
+    def get_task_status(self, task):
+        url = f"{self._domain_url}/job/taskstatuses/{task['id']}"
+        response = self.session.get(url)
+        response.raise_for_status()
+        return response.json()
 
-    return ftds
+    def wait_for_task(self, task, interval=5):
+        while True:
+            result = self.get_task_status(task)
+            if result["status"] == "SUCCESS":
+                return result
+            time.sleep(interval)
 
+    def download_reports(self, task):
+        url = f"{self._domain_url}/job/taskstatuses/{task['id']}/operational/downloadreports"
+        response = self.session.get(url)
+        response.raise_for_status()
+        return response.json()
 
-def bulk_command(session, cmd, manager, ftds):
-    url = f"{BASE_URL}/v1/cdfmc/api/fmc_config/v1/domain/{manager['fmcDomainUid']}/devices/devicerecords/operational/bulkcommands"
-    payload = {
-        "command": cmd,
-        "devices": [ftd["uidOnFmc"] for ftd in ftds],
-        "type": "BulkCommand",
-    }
-    response = session.post(url, json=payload)
-    response.raise_for_status()
-    return response.json()["metadata"]["task"]
-
-
-def get_task_status(session, manager, task):
-    url = f"{BASE_URL}/v1/cdfmc/api/fmc_config/v1/domain/{manager['fmcDomainUid']}/job/taskstatuses/{task['id']}"
-    response = session.get(url)
-    response.raise_for_status()
-    return response.json()
-
-
-def download_reports(session, manager, task):
-    url = f"{BASE_URL}/v1/cdfmc/api/fmc_config/v1/domain/{manager['fmcDomainUid']}/job/taskstatuses/{task['id']}/operational/downloadreports"
-    response = session.get(url)
-    response.raise_for_status()
-    return response.json()
+    def command(self, cmd, device_uid, parameters=None):
+        url = f"{self._domain_url}/devices/devicerecords/{device_uid}/operational/commands"
+        params = {"command": cmd}
+        if parameters is not None:
+            params["parameters"] = parameters
+        response = self.session.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
 
 
 def main():
@@ -86,24 +107,31 @@ def main():
     args = parser.parse_args()
     cmd = " ".join(args.cmd)
 
-    session = requests.Session()
-    session.headers.update(get_headers())
+    # Create the client
+    client = SCCClient()
 
-    manager = get_manager(session)
+    # Get the FMC UUID
+    manager = client.get_manager()
     print(f"Manager: {manager['address']}")
 
-    ftds = get_ftds(session)
+    # Get the list of FTDs
+    ftds = client.get_ftds()
     print(f"Retrieved {len(ftds)} FTD device(s).")
 
-    task = bulk_command(session, cmd, manager, ftds)
+    # Testing a single command execution. This is a synchronous call
+    result = client.command(cmd, ftds[0]["uidOnFmc"])
 
-    while True:
-        task_results = get_task_status(session, manager, task)
-        if task_results["status"] == "SUCCESS":
-            break
-        time.sleep(5)
+    # Run a bulk command against all devices
+    task = client.bulk_command(cmd)
 
-    reports = download_reports(session, manager, task)
+    # Poll for bulk command completion
+    client.wait_for_task(task)
+
+    # Get the command results
+    # TODO: Deal with paging the result if needed
+    reports = client.download_reports(task)
+
+    # Print the results to the terminal
     print(f"Command: {reports['command']}\n")
     for device in reports["deviceResponse"]:
         print(f"Device: {device['deviceName']}")
